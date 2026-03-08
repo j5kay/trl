@@ -13,6 +13,54 @@
 # limitations under the License.
 
 from transformers import AddedToken, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
+import logging
+
+logger = logging.getLogger(__name__)
+
+# GPT-OSS helpers: template detection and training template generation.
+# The gpt-oss chat template is too long (~16K chars) to store as a constant, so we detect it
+# by unique markers and patch it via string replacement.
+
+# Unique substring present in gpt-oss templates but not in Qwen/Llama templates
+_GPT_OSS_MARKER = "<|channel|>analysis<|message|>"
+
+# The non-last assistant message block that needs patching for prefix preservation.
+# Original: uses <|end|> and drops CoT for non-last assistant turns.
+_GPT_OSS_OLD_BLOCK = (
+    '        {%- else %}\n'
+    '            {#- CoT is dropped during all previous turns, so we never render it for inference #}\n'
+    '            {{- "<|start|>assistant<|channel|>final<|message|>" + message.content + "<|end|>" }}\n'
+    '            {%- set last_tool_call.name = none %}\n'
+    '        {%- endif %}'
+)
+
+# Patched: uses <|return|> (EOS) consistently and preserves thinking/analysis blocks.
+_GPT_OSS_NEW_BLOCK = (
+    '        {%- else %}\n'
+    '            {%- if "thinking" in message and message.thinking %}\n'
+    '                {{- "<|start|>assistant<|channel|>analysis<|message|>" + message.thinking + "<|end|>" }}\n'
+    '            {%- endif %}\n'
+    '            {{- "<|start|>assistant<|channel|>final<|message|>" + message.content + "<|return|>" }}\n'
+    '            {%- set last_tool_call.name = none %}\n'
+    '        {%- endif %}'
+)
+
+def _is_gpt_oss_template(chat_template: str) -> bool:
+    """Check if a chat template is a gpt-oss variant"""
+    return _GPT_OSS_MARKER in chat_template
+
+def _make_gpt_oss_training_template(chat_template: str) -> str:
+    """Patch a gpt-oss chat template for prefix-preserving training.
+
+    Changes non-last assistant final messages to use <|return|> (EOS) instead
+    of <|end|>, and preserves thinking/analysis blocks across all turns.
+    """
+    if _GPT_OSS_OLD_BLOCK not in chat_template:
+        raise ValueError(
+            "Could not find the expected non-last assistant block in the gpt-oss chat template. "
+            "The template may have changed — please update the patching logic."
+        )
+    return chat_template.replace(_GPT_OSS_OLD_BLOCK, _GPT_OSS_NEW_BLOCK)
 
 
 def clone_chat_template(
@@ -108,6 +156,50 @@ def clone_chat_template(
     added_tokens = tokenizer.convert_tokens_to_ids(added_tokens)
     return model, tokenizer, added_tokens
 
+
+# GPT-OSS (openai/gpt-oss-20b, openai/gpt-oss-120b) response schema.
+# The model uses <|channel|>analysis for reasoning, <|channel|>final for content,
+# and "assistant to=functions.{name}" for tool calls.
+# GPT-OSS response schema handles two tool call formats:
+# 1. Model generation: <|channel|>commentary to=functions.{name} <|constrain|>json<|message|>{args}<|call|>
+# 2. Template encoding: <|start|>assistant to=functions.{name}<|channel|>commentary json<|message|>{args}<|call|>
+# The tool_calls group uses a broad match (.+<|call|>) to catch both, and the iterator
+# extracts the name+args via to=functions\. which is common to both formats.
+gpt_oss_schema = {
+    "x-regex": (
+        r"^(?:<\|channel\|>analysis<\|message\|>(?P<reasoning_content>.*?)<\|end\|>(?:<\|start\|>assistant)?)?"
+        r"(?:<\|channel\|>final<\|message\|>(?P<content>.*?)(?:<\|return\|>|<\|end\|>|$)"
+        r"|(?P<tool_calls>.+<\|call\|>))?"
+    ),
+    "type": "object",
+    "properties": {
+        "role": {"const": "assistant"},
+        "content": {"type": "string"},
+        "reasoning_content": {"type": "string"},
+        "tool_calls": {
+            "type": "array",
+            "x-regex-iterator": r"to=functions\.(.+?<\|call\|>)",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"const": "function"},
+                    "function": {
+                        "type": "object",
+                        "x-regex": r"^(?P<name>[^<\s]+).*?<\|message\|>(?P<arguments>.*?)(?:<\|call\|>)?$",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "arguments": {
+                                "type": "object",
+                                "x-parser": "json",
+                                "additionalProperties": {},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
 
 # Adapted and corrected versions of the schemas from:
 # https://github.com/huggingface/transformers/blob/main/tests/utils/test_chat_parsing_utils.py
@@ -461,6 +553,9 @@ def add_response_schema(tokenizer: PreTrainedTokenizer) -> PreTrainedTokenizer:
     if tokenizer.chat_template == qwen35_chat_template:
         tokenizer.response_schema = qwen35_schema
         return tokenizer
+    if _is_gpt_oss_template(tokenizer.chat_template):
+        tokenizer.response_schema = gpt_oss_schema
+        return tokenizer
     raise ValueError(
         "Unrecognized chat template, failed to add response schema. Please manually set the response schema on the "
         "tokenizer or processor. See the Transformers "
@@ -484,13 +579,18 @@ def is_chat_template_prefix_preserving(tokenizer: PreTrainedTokenizer) -> bool:
     messages1 = [
         {"role": "user", "content": "What color is the sky?"},
     ]
+    # We include reasoning in both `messages2` and `messages3` because some templates emit reasoning only when the
+    # final conversation message is an assistant turn. This lets us detect templates that drop earlier reasoning and
+    # break prefix preservation.
+    # We set both `reasoning_content` and `thinking` since different templates expect different keys (for example
+    # GPT-OSS vs Qwen3); templates ignore the key they don't use.
     messages2 = [
         {"role": "user", "content": "What color is the sky?"},
-        {"role": "assistant", "content": "It is blue."},
+        {"role": "assistant", "reasoning_content": "Hmmm", "thinking": "Hmmm", "content": "It is blue."},
     ]
     messages3 = [
         {"role": "user", "content": "What color is the sky?"},
-        {"role": "assistant", "content": "It is blue."},
+        {"role": "assistant", "reasoning_content": "Hmmm", "thinking": "Hmmm", "content": "It is blue."},
         {"role": "user", "content": "And at night?"},
     ]
 
@@ -498,7 +598,28 @@ def is_chat_template_prefix_preserving(tokenizer: PreTrainedTokenizer) -> bool:
     text2 = tokenizer.apply_chat_template(messages2, tokenize=False)
     text3 = tokenizer.apply_chat_template(messages3, tokenize=False)
 
-    return text2.startswith(text1) and text3.startswith(text2)
+    if not (text2.startswith(text1) and text3.startswith(text2)):
+        return False
+
+    # Check tool-calling prefix preservation when supported by the template. Some templates (like GPT-OSS) render
+    # analysis text for an assistant tool-call turn only when no later assistant-final turn exists.
+    prompt_and_tool = [
+        {"role": "user", "content": "What is 2+2?"},
+        {
+            "role": "assistant",
+            "content": "Let me think about this...",
+            "tool_calls": [{"function": {"name": "calculator", "arguments": '{"a": 2, "b": 2}'}}],
+        },
+        {"role": "tool", "content": "4"},
+    ]
+    final = [{"role": "assistant", "content": "The answer is 4."}]
+    text1 = tokenizer.apply_chat_template(prompt_and_tool, tokenize=False, add_generation_prompt=True)
+    text2 = tokenizer.apply_chat_template(prompt_and_tool + final, tokenize=False)
+
+    if not text2.startswith(text1):
+        return False
+
+    return True
 
 
 # Modifications:
@@ -592,6 +713,23 @@ qwen3_training_chat_template = r"""{%- if tools %}
 {%- endif %}"""
 
 # Modifications:
+# - {{- "<|start|>assistant<|channel|>final<|message|>" + message.content + "<|return|>" }}
+# + {{- "<|start|>assistant<|channel|>final<|message|>" + message.content + "<|end|>" }}
+#   In the original template, only the last assistant message ends with <|return|>, while other turns use <|end|>.
+#   This breaks prefix preservation, so the training template uses <|end|> consistently.
+#   As a result, <|return|> is not seen during training with this template;
+#   GRPO's objective is based on relative scoring across sampled outputs, so this template change may not materially
+#   reduce the model's ability to use <|return|> at inference. However, this is a hypothesis, and it should be
+#   confirmed with targeted evaluations
+# - {%- elif loop.last and not add_generation_prompt %}
+# + {%- elif true and not add_generation_prompt %}
+#   Always include thinking block during training. It's important to have a prefix-preserving template.
+# - {%- elif message.content and not future_final_message.found %}
+# + {%- elif message.content %}
+# - {%- elif message.thinking and not future_final_message.found %}
+# + {%- elif message.thinking %}
+#   Even if there is a final message after the tool calls, we want to keep the analysis for prefix preservation.
+# docstyle-ignore
 # - {%- if '</think>' in content %}
 # + {%- if '<think>' in content and '</think>' in content %}
 #   Always check for both tags to avoid edge cases where the model generates only one tag, which would otherwise be parsed incorrectly
@@ -611,8 +749,8 @@ def get_training_chat_template(tokenizer: PreTrainedTokenizer) -> str | None:
     r"""
     Get a prefix-preserving chat template for training, if needed.
 
-    If the tokenizer's template isn't prefix-preserving, returns a training-compatible template (currently Qwen3 and
-    Qwen3.5 supported). Otherwise, returns `None`.
+    If the tokenizer's template isn't prefix-preserving, returns a training-compatible template (currently Qwen3,
+    Qwen3.5 and GPT-OSS supported). Otherwise, returns `None`.
 
     Args:
         tokenizer (`PreTrainedTokenizer`):
@@ -657,6 +795,8 @@ def get_training_chat_template(tokenizer: PreTrainedTokenizer) -> str | None:
     if is_chat_template_prefix_preserving(tokenizer):
         return None  # No patching needed
 
+    if _is_gpt_oss_template(tokenizer.chat_template):
+        return _make_gpt_oss_training_template(tokenizer.chat_template)
     if tokenizer.chat_template == qwen3_chat_template:
         return qwen3_training_chat_template
     if tokenizer.chat_template == qwen35_chat_template:
@@ -740,15 +880,31 @@ def parse_response(tokenizer: PreTrainedTokenizer, ids: list[int]) -> dict:
     ```
     """
     try:
-        parsed = tokenizer.parse_response(ids)
+        content = tokenizer.decode(ids, skip_special_tokens=False)
+        logger.info(f'>> content (special_tokens): {content}')
+
+        parsed: dict = tokenizer.parse_response(ids)
+        logger.info(f'>> parsed: {parsed}')
+
         # Hotfix: remove incorrectly appended EOS token from tool calls
         # See https://github.com/huggingface/transformers/issues/42249
-        parsed["content"] = parsed["content"].removesuffix(tokenizer.eos_token)
+        content: str = parsed.get("content", parsed.get("reasoning_content"))
+        if content:
+            parsed["content"] = content.removesuffix(tokenizer.eos_token)
+
+        # reasoning_content: str = parsed.get("reasoning_content")
+        # if reasoning_content:
+        #     parsed["reasoning_content"] = reasoning_content.removesuffix(tokenizer.eos_token)
+
         # Validate tool_calls to prevent Jinja2 Undefined errors when fields are missing
-        if "tool_calls" in parsed:
-            _validate_tool_calls(parsed["tool_calls"])
-    except (ValueError, TypeError):
+        tool_calls = parsed.get("tool_calls")
+        if tool_calls:
+            _validate_tool_calls(tool_calls=tool_calls)
+
+    except (ValueError, TypeError, KeyError):
         # Fallback: decode as plain text if parsing fails. This happens if the model outputs malformed tool calls.
-        content = tokenizer.decode(ids, skip_special_tokens=True)
-        parsed = {"role": "assistant", "content": content}
+        raw_content = tokenizer.decode(ids, skip_special_tokens=True)
+        logger.info(f'>> content (no_tokens): {raw_content}')
+        parsed = {"role": "assistant", "content": raw_content}
+
     return parsed

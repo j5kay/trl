@@ -278,6 +278,7 @@ class GRPOTrainer(_BaseTrainer):
         tools: list[Callable] | None = None,
         rollout_func: RolloutFunc | None = None,
         environment_factory: EnvironmentFactory | None = None,
+        extra_eos_tokens: list[str] | None = None,
     ):
         # Args
         if args is None:
@@ -327,6 +328,17 @@ class GRPOTrainer(_BaseTrainer):
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
+
+        # Support models that may use different eos tokens for different types of output (i.e., tool-calling)
+        if extra_eos_tokens:
+            extra_eos = []
+            for tok in extra_eos_tokens:
+                tid = tokenizer.convert_tokens_to_ids(tok)
+                if isinstance(tid, int) and tid != tokenizer.unk_token_id and tid != self.eos_token_id:
+                    extra_eos.append(tid)
+            if extra_eos:
+                self.eos_token_id = [self.eos_token_id] + extra_eos
+                logger.info(f'>> Using eos tokens: {self.eos_token_id}')
 
         if is_peft_available() and is_peft_model(model) and peft_config is not None:
             raise ValueError(
@@ -751,7 +763,7 @@ class GRPOTrainer(_BaseTrainer):
                 "do_sample": True,
                 "pad_token_id": tokenizer.pad_token_id,
                 "bos_token_id": tokenizer.bos_token_id,
-                "eos_token_id": tokenizer.eos_token_id,
+                "eos_token_id": self.eos_token_id,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
                 "top_k": self.top_k,
@@ -1323,16 +1335,21 @@ class GRPOTrainer(_BaseTrainer):
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
+                logger.info('....::| generating |::....')
                 prompt_completion_ids = unwrapped_model.generate(
                     **generate_inputs, generation_config=self.generation_config, disable_compile=True
                 )
+
             # Compute prompt length and extract completion ids
             prompt_ids, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
             prompt_length = prompt_ids.size(1)
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
             # Mask everything after the first EOS token
-            is_eos = completion_ids == self.eos_token_id
+            if isinstance(self.eos_token_id, list):
+                is_eos = torch.isin(completion_ids, torch.tensor(self.eos_token_id, device=device))
+            else:
+                is_eos = completion_ids == self.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
@@ -1353,32 +1370,89 @@ class GRPOTrainer(_BaseTrainer):
         tool_call_count = 0
         tool_failure_count = 0
         iteration_num = 0
+
+        # START
+        # Cache generation count + inputs (from _generate_and_score_completions)
+        inputs = getattr(self, '_current_inputs', None)
+        mode = 'train' if self.model.training else 'eval'
+        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+        logger.info(f'---> num_generations: {num_generations} ({mode=})')
+        # note - self.args is actually of type GRPOConfig
+        # batch_size = self.args.per_device_train_batch_size    # 3
+        # grad_accum = self.args.gradient_accumulation_steps    # 2
+        # steps_per_gen = self.args.steps_per_generation        # 4 (from GRPOConfig)
+        # samples_per_optimizer_step = batch_size * grad_accum  # 3 * 2 = 6
+
+        # logger.info(f'#### {len(inputs)=} -- {[i.get("task_id") for i in inputs]}')
+        # logger.info(f'#### {len(completions)=}')
+        # logger.info(f'#### {samples_per_optimizer_step=}')
+        # STOP
+
         while idxs_with_tool and iteration_num < self.max_tool_calling_iterations:
             prompt_completion_tools = [prompts[i] for i in idxs_with_tool]  # select only prompts that need tool calls
 
             # Call the tools, and build the new prompt for generation
+            idxs_to_remove = set()
             for idx in range(len(idxs_with_tool)):
                 idx_with_tool = idxs_with_tool[idx]
                 tool_call_list = tool_calls[idx]
                 prompt_completion_tool = prompt_completion_tools[idx]
                 sync_tool_dict = self._sync_tool_dicts[idx_with_tool]
                 async_tool_dict = self._async_tool_dicts[idx_with_tool]
+                latest_completion: dict = completions[idx_with_tool][-1]
+                latest_completion_ids: list[int] = completion_ids[idx_with_tool]
+                latest_logprob = logprobs  # [idx_with_tool]
+                # logger.info(f'---> len(latest_completion_ids): {len(latest_completion_ids)}')
+                # logger.info(f'---> len(latest_logprob): {len(latest_logprob)}')
+                # logger.info(f'---> latest_logprob: {latest_logprob}')
+
+                # Snapshot prompt length before appending assistant message
+                prompt_snapshot_len = len(prompt_completion_tool)
+
                 # Append the last assistant message (which triggered tool_calls) to the prompt
-                prompt_completion_tool.append(completions[idx_with_tool][-1])
+                prompt_completion_tool.append(latest_completion)
                 async_coros = []
                 tool_call_results = []
+
                 for tool_call in tool_call_list:
                     tool_call_count += 1
                     if tool_call["type"] == "function":
-                        function = tool_call["function"]
-                        name = function["name"]
+                        name = '_unknown'
                         try:
+                            function = tool_call["function"]
+                            name = function["name"]
+                            # pass along dataset item + context in the tool_call
+                            ignored = ['prompt']
+                            _in: dict = inputs[idx_with_tool] if inputs else {}
+                            _in = {k: _in[k] for k in _in.keys() if k not in ignored} if _in else None
+                            _state = {
+                                'completion': latest_completion,  # the completion from whence this tool_call came
+                                'completion_ids': latest_completion_ids,  # completion_tokens from whence this tool_call came
+                                'logprobs': latest_logprob,  # logprobs from whence this tool_call came
+                                'input': _in,  # dataset item used for this tool_call
+                                'idx': idx_with_tool % num_generations,  # index of the tool_call input's num_generations array
+                            }
+
+                            _args = dict(function['arguments'])
+                            # logger.info(f'tool_call --> {name}({_args})')
+                            _args['_state'] = _state
+
                             if name in sync_tool_dict:
-                                tool_call_results.append((name, sync_tool_dict[name](**function["arguments"])))
+                                result = sync_tool_dict[name](**_args)
+								# Tool returned None --> stop generating for this item
+                                if result is None:
+			                        # Roll back prompt to before the assistant message was appended
+                                    # del prompt_completion_tool[prompt_snapshot_len:]
+                                    idxs_to_remove.add(idx)
+                                    break
+
+                                tool_call_results.append((name, result))
+
                             elif name in async_tool_dict:
-                                async_coros.append((name, async_tool_dict[name](**function["arguments"])))
+                                async_coros.append((name, async_tool_dict[name](**_args)))
                             else:
                                 raise ValueError(f"Tool {name} not found.")
+
                         except Exception as e:
                             tool_failure_count += 1
                             result = {"error": str(e)}
@@ -1389,7 +1463,6 @@ class GRPOTrainer(_BaseTrainer):
                         tool_call_results.append((name, {"error": f"Unsupported tool call type: {tool_call['type']}"}))
 
                 if async_coros:
-
                     async def _run_async_tools(async_coros):
                         coros = [coro for _, coro in async_coros]
                         results = await asyncio.gather(*coros, return_exceptions=True)
@@ -1410,6 +1483,16 @@ class GRPOTrainer(_BaseTrainer):
                     tool_message = {"role": "tool", "name": name, "content": str(result)}
                     prompt_completion_tool.append(tool_message)
                     completions[idx_with_tool].append(tool_message)
+
+            # START - Filter out items where a tool signalled stop (returned None)
+            logger.info(f'>>>>>>!!!!!>>>>> Break? {idxs_to_remove}')
+            if len(idxs_to_remove) > 0:
+                idxs_with_tool = [v for i, v in enumerate(idxs_with_tool) if i not in idxs_to_remove]
+                prompt_completion_tools = [v for i, v in enumerate(prompt_completion_tools) if i not in idxs_to_remove]
+                logger.info(f'>>>>>>!!!!!>>>>> Break? {idxs_with_tool}')
+                if not idxs_with_tool:
+                    break  # all items stopped, exit tool loop
+            # STOP
 
             # Tokenize and filter samples whose length exceeds max allowed length. This is important, because both
             # vLLM and transformers will error out if the input is longer than the model's max length.
@@ -1443,6 +1526,7 @@ class GRPOTrainer(_BaseTrainer):
             # Keep only non-overlong items for further processing
             idxs_with_tool = [idx for idx, o in zip(idxs_with_tool, overlong, strict=True) if not o]
             prompt_completion_tools = [pct for pct, o in zip(prompt_completion_tools, overlong, strict=True) if not o]
+            logger.info(f'>>>>>>!!!!!>>>>> Break pt2? {idxs_with_tool}')
             if not idxs_with_tool:
                 break  # all overlong, exit tool loop
 
@@ -1521,7 +1605,9 @@ class GRPOTrainer(_BaseTrainer):
         # Copy the prompts to avoid modifying the original list
         prompts = copy.deepcopy(prompts)
 
+        logger.info(f'--> generate: {len(prompts)} prompts')
         prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts)
+        logger.info(f'--> generate: COMPLETED')
 
         # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
         if is_conversational({"prompt": prompts[0]}):
@@ -1537,6 +1623,8 @@ class GRPOTrainer(_BaseTrainer):
                 completions = [[{"role": "assistant", "content": content}] for content in contents]
         else:
             completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+        logger.info(f'>> completions: {completions}')
 
         # Extract tool calls from the completions and (possibly) execute them
         if self.tools:
@@ -1575,7 +1663,8 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
         # Identify sequences that terminated with EOS and log their lengths
-        eos_and_pad = [self.eos_token_id, self.pad_token_id]
+        eos_ids = self.eos_token_id if isinstance(self.eos_token_id, list) else [self.eos_token_id]
+        eos_and_pad = set(eos_ids + [self.pad_token_id])
         is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
         agg_is_truncated = self.accelerator.gather(is_truncated)
         self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
@@ -1613,6 +1702,10 @@ class GRPOTrainer(_BaseTrainer):
         mode = "train" if self.model.training else "eval"
 
         prompts = [x["prompt"] for x in inputs]
+
+        # track the dataset item being processed to pass along in tool_calls
+        self._current_inputs = inputs
+        # logger.info(f'###### ({len(inputs)} -- {[i.get("task_id") for i in inputs]})')
 
         if self.environments:
             for prompt, environment, reset_kwargs in zip(prompts, self.environments, inputs, strict=True):
@@ -1700,7 +1793,8 @@ class GRPOTrainer(_BaseTrainer):
 
         # If mask_truncated_completions is enabled, zero out truncated completions for attention and loss masking
         if self.mask_truncated_completions:
-            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            eos_ids = self.eos_token_id if isinstance(self.eos_token_id, list) else [self.eos_token_id]
+            eos_and_pad = set(eos_ids + [self.pad_token_id])
             is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
             # Mask completion_mask for attention masking
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
