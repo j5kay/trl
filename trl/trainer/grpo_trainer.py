@@ -1401,10 +1401,7 @@ class GRPOTrainer(_BaseTrainer):
                 async_tool_dict = self._async_tool_dicts[idx_with_tool]
                 latest_completion: dict = completions[idx_with_tool][-1]
                 latest_completion_ids: list[int] = completion_ids[idx_with_tool]
-                latest_logprob = logprobs  # [idx_with_tool]
-                # logger.info(f'---> len(latest_completion_ids): {len(latest_completion_ids)}')
-                # logger.info(f'---> len(latest_logprob): {len(latest_logprob)}')
-                # logger.info(f'---> latest_logprob: {latest_logprob}')
+                latest_logprob = logprobs[idx_with_tool] if logprobs is not None else None
 
                 # Snapshot prompt length before appending assistant message
                 prompt_snapshot_len = len(prompt_completion_tool)
@@ -1439,6 +1436,7 @@ class GRPOTrainer(_BaseTrainer):
 
                             if name in sync_tool_dict:
                                 result = sync_tool_dict[name](**_args)
+                                _state.clear()  # release batch references held by _state
 								# Tool returned None --> stop generating for this item
                                 if result is None:
 			                        # Roll back prompt to before the assistant message was appended
