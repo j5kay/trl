@@ -1302,6 +1302,7 @@ class GRPOTrainer(_BaseTrainer):
             prompt_ids = processor_outputs["input_ids"]
             logprobs = None  # not used in this case
             extra_fields = {}  # No extra fields for paged mode
+            del processor_outputs, all_outputs
 
         else:
             # Regular generation path
@@ -1358,6 +1359,11 @@ class GRPOTrainer(_BaseTrainer):
             completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool(), strict=True)]
             logprobs = None  # not used in this case
             extra_fields = {}  # No extra fields for non-rollout_func paths
+
+            # Explicitly free GPU tensors before returning so they don't persist
+            # alongside the next iteration's allocations in the tool-call loop.
+            del generate_inputs, prompt_completion_ids, prompt_mask
+            del is_eos, eos_idx, sequence_indices, completion_mask
 
         return prompt_ids, completion_ids, logprobs, extra_fields
 
@@ -1561,6 +1567,9 @@ class GRPOTrainer(_BaseTrainer):
             prompt_completion_tool_ids, post_tool_ids, post_tool_logprobs, _ = self._generate_single_turn(
                 prompt_completion_tools
             )
+            # Release CUDA cached blocks so the next iteration (with longer context) can reuse the memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Sanity check: from experience, this is useful to catch bugs in the chat template
             for idx in range(len(idxs_with_tool)):
