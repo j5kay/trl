@@ -1440,11 +1440,11 @@ class GRPOTrainer(_BaseTrainer):
                             if name in sync_tool_dict:
                                 result = sync_tool_dict[name](**_args)
 								# Tool returned None --> stop generating for this item
-                                if result is None:
-			                        # Roll back prompt to before the assistant message was appended
-                                    # del prompt_completion_tool[prompt_snapshot_len:]
-                                    idxs_to_remove.add(idx)
-                                    break
+                                # if result is None:
+			                    #     # Roll back prompt to before the assistant message was appended
+                                #     # del prompt_completion_tool[prompt_snapshot_len:]
+                                #     idxs_to_remove.add(idx)
+                                #     break
 
                                 tool_call_results.append((name, result))
 
@@ -1535,15 +1535,14 @@ class GRPOTrainer(_BaseTrainer):
                 prompt_completion_tools
             )
 
-            # # Sanity check: from experience, this is useful to catch bugs in the chat template
-            # for idx in range(len(idxs_with_tool)):
-            #     idx_with_tool = idxs_with_tool[idx]
-            #     pct = prompt_completion_tool_ids[idx]  # = prompt-completion-tool
-            #     if prompt_ids[idx_with_tool] != pct[: len(prompt_ids[idx_with_tool])]:
-            #         raise ValueError(
-            #             "The chat template is not prefix-preserving. Please update it to use a prefix-preserving "
-            #             "format."
-            #         )
+            # Sanity check: from experience, this is useful to catch bugs in the chat template
+            for idx in range(len(idxs_with_tool)):
+                idx_with_tool = idxs_with_tool[idx]
+                pct = prompt_completion_tool_ids[idx]  # = prompt-completion-tool
+                if prompt_ids[idx_with_tool] != pct[: len(prompt_ids[idx_with_tool])]:
+                    raise ValueError(
+                        f"The chat template is not prefix-preserving. Please update it to use a prefix-preserving format.\n{prompt_ids[idx_with_tool]=}\n{pct[:len(prompt_ids[idx_with_tool])]=}"
+                    )
 
             # Truncate so that pct[len(prompt_ids[idx]) :] + post_tool does not exceed max_completion_length
             for idx in range(len(idxs_with_tool)):
