@@ -1440,11 +1440,34 @@ class GRPOTrainer(_BaseTrainer):
                             if name in sync_tool_dict:
                                 result = sync_tool_dict[name](**_args)
 								# Tool returned None --> stop generating for this item
-                                # if result is None:
-			                    #     # Roll back prompt to before the assistant message was appended
-                                #     # del prompt_completion_tool[prompt_snapshot_len:]
-                                #     idxs_to_remove.add(idx)
-                                #     break
+                                if result is None:
+			                        # Roll back prompt to before the assistant message was appended
+                                    del prompt_completion_tool[prompt_snapshot_len:]
+
+                                    # Finalize this slot's outputs so they are internally consistent.
+                                    # Re-tokenize the rolled-back prompt to get correct completion_ids.
+                                    _pct_ids = self.processing_class.apply_chat_template(
+                                        prompt_completion_tool,
+                                        tools=self.tools,
+                                        chat_template=self.chat_template,
+                                        add_generation_prompt=False,
+                                        tokenize=True,
+                                        return_dict=False,
+                                        **self.chat_template_kwargs,
+                                    )
+                                    _prompt_len = len(prompt_ids[idx_with_tool])
+                                    completion_ids[idx_with_tool] = _pct_ids[_prompt_len:_prompt_len + self.max_completion_length]
+                                    _clen = len(completion_ids[idx_with_tool])
+                                    tool_mask[idx_with_tool] = tool_mask[idx_with_tool][:_clen]
+                                    if logprobs is not None:
+                                        logprobs[idx_with_tool] = logprobs[idx_with_tool][:_clen]
+
+                                    # Remove the unanswered tool-call assistant message from completions
+                                    if completions[idx_with_tool] and completions[idx_with_tool][-1].get("tool_calls"):
+                                        completions[idx_with_tool].pop()
+
+                                    idxs_to_remove.add(idx)
+                                    break
 
                                 tool_call_results.append((name, result))
 
@@ -1487,6 +1510,9 @@ class GRPOTrainer(_BaseTrainer):
             # START - Filter out items where a tool signalled stop (returned None)
             logger.info(f'>>>>>>!!!!!>>>>> Break? {idxs_to_remove}')
             if len(idxs_to_remove) > 0:
+                # Free conversation data for removed slots
+                for i in idxs_to_remove:
+                    prompts[idxs_with_tool[i]] = None
                 idxs_with_tool = [v for i, v in enumerate(idxs_with_tool) if i not in idxs_to_remove]
                 prompt_completion_tools = [v for i, v in enumerate(prompt_completion_tools) if i not in idxs_to_remove]
                 logger.info(f'>>>>>>!!!!!>>>>> Break? {idxs_with_tool}')
@@ -1523,7 +1549,10 @@ class GRPOTrainer(_BaseTrainer):
                     tool_mask[idx_with_tool] += [1] * (len(ct) - len(tool_mask[idx_with_tool]))
                     if logprobs is not None:
                         logprobs[idx_with_tool] += [0.0] * (len(ct) - len(logprobs[idx_with_tool]))
-            # Keep only non-overlong items for further processing
+            # Keep only non-overlong items for further processing; free conversation data for overlong slots
+            for idx, o in zip(idxs_with_tool, overlong, strict=True):
+                if o:
+                    prompts[idx] = None
             idxs_with_tool = [idx for idx, o in zip(idxs_with_tool, overlong, strict=True) if not o]
             prompt_completion_tools = [pct for pct, o in zip(prompt_completion_tools, overlong, strict=True) if not o]
             logger.info(f'>>>>>>!!!!!>>>>> Break pt2? {idxs_with_tool}')
@@ -1592,8 +1621,14 @@ class GRPOTrainer(_BaseTrainer):
 
             # Check for further tool calls
             tool_calls = [completion.get("tool_calls") for completion in post_tool_completions]
+            prev_idxs = set(idxs_with_tool)
             idxs_with_tool = [idx for idx, tool_call in zip(idxs_with_tool, tool_calls, strict=True) if tool_call]
             tool_calls = [tool_call for tool_call in tool_calls if tool_call]
+
+            # Free conversation data for slots that just finished (no more tool calls)
+            for finished_idx in prev_idxs - set(idxs_with_tool):
+                prompts[finished_idx] = None
+
             iteration_num += 1
         return tool_mask, completions, completion_ids, logprobs, tool_call_count, tool_failure_count
 
@@ -1957,6 +1992,7 @@ class GRPOTrainer(_BaseTrainer):
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
         rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        self._current_inputs = None  # release batch reference to allow GC
         num_generations = self.num_generations if mode == "train" else self.num_generations_eval
 
         if self.multi_objective_aggregation == "sum_then_normalize":
