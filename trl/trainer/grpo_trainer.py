@@ -1447,29 +1447,9 @@ class GRPOTrainer(_BaseTrainer):
                                 if result is None:
 			                        # Roll back prompt to before the assistant message was appended
                                     del prompt_completion_tool[prompt_snapshot_len:]
-
-                                    # Finalize this slot's outputs so they are internally consistent.
-                                    # Re-tokenize the rolled-back prompt to get correct completion_ids.
-                                    _pct_ids = self.processing_class.apply_chat_template(
-                                        prompt_completion_tool,
-                                        tools=self.tools,
-                                        chat_template=self.chat_template,
-                                        add_generation_prompt=False,
-                                        tokenize=True,
-                                        return_dict=False,
-                                        **self.chat_template_kwargs,
-                                    )
-                                    _prompt_len = len(prompt_ids[idx_with_tool])
-                                    completion_ids[idx_with_tool] = _pct_ids[_prompt_len:_prompt_len + self.max_completion_length]
-                                    _clen = len(completion_ids[idx_with_tool])
-                                    tool_mask[idx_with_tool] = tool_mask[idx_with_tool][:_clen]
-                                    if logprobs is not None:
-                                        logprobs[idx_with_tool] = logprobs[idx_with_tool][:_clen]
-
-                                    # Remove the unanswered tool-call assistant message from completions
-                                    if completions[idx_with_tool] and completions[idx_with_tool][-1].get("tool_calls"):
-                                        completions[idx_with_tool].pop()
-
+                                    # completion_ids, tool_mask, and logprobs are already consistent
+                                    # from the previous iteration — leave them as-is to avoid
+                                    # length mismatches from re-tokenization (BPE merging differences).
                                     idxs_to_remove.add(idx)
                                     break
 
@@ -1550,9 +1530,18 @@ class GRPOTrainer(_BaseTrainer):
                     prompt_length = len(prompt_ids[idx_with_tool])
                     ct = pct_ids[idx][prompt_length : prompt_length + self.max_completion_length]
                     completion_ids[idx_with_tool] = ct
-                    tool_mask[idx_with_tool] += [1] * (len(ct) - len(tool_mask[idx_with_tool]))
+                    ct_len = len(ct)
+                    tm_len = len(tool_mask[idx_with_tool])
+                    if ct_len >= tm_len:
+                        tool_mask[idx_with_tool] += [1] * (ct_len - tm_len)
+                    else:
+                        tool_mask[idx_with_tool] = tool_mask[idx_with_tool][:ct_len]
                     if logprobs is not None:
-                        logprobs[idx_with_tool] += [0.0] * (len(ct) - len(logprobs[idx_with_tool]))
+                        lp_len = len(logprobs[idx_with_tool])
+                        if ct_len >= lp_len:
+                            logprobs[idx_with_tool] += [0.0] * (ct_len - lp_len)
+                        else:
+                            logprobs[idx_with_tool] = logprobs[idx_with_tool][:ct_len]
             # Keep only non-overlong items for further processing; free conversation data for overlong slots
             for idx, o in zip(idxs_with_tool, overlong, strict=True):
                 if o:
@@ -1603,10 +1592,23 @@ class GRPOTrainer(_BaseTrainer):
                 prompt_length = len(prompt_ids[idx_with_tool])
                 completion_length = len(completion_ids[idx_with_tool])
                 post_tool_length = len(post_tool_ids[idx])
-                tool_length = prompt_completion_tool_length - prompt_length - completion_length
-                tool_mask[idx_with_tool] += [0] * tool_length + [1] * post_tool_length
+                # Re-tokenization may merge tokens at boundaries, producing fewer tokens
+                # than the incrementally-built completion_ids. Compute how many old mask
+                # entries to keep and how many new tool-result zeros to add.
+                pct_completion_length = prompt_completion_tool_length - prompt_length
+                old_to_keep = min(pct_completion_length, completion_length)
+                tool_result_length = max(0, pct_completion_length - completion_length)
+                tool_mask[idx_with_tool] = (
+                    tool_mask[idx_with_tool][:old_to_keep]
+                    + [0] * tool_result_length
+                    + [1] * post_tool_length
+                )
                 if logprobs is not None:
-                    logprobs[idx_with_tool] += [0.0] * tool_length + post_tool_logprobs[idx]
+                    logprobs[idx_with_tool] = (
+                        logprobs[idx_with_tool][:old_to_keep]
+                        + [0.0] * tool_result_length
+                        + post_tool_logprobs[idx]
+                    )
 
             # Update completion_ids with the new completions (after tool execution)
             for idx in range(len(idxs_with_tool)):
