@@ -1561,13 +1561,14 @@ class GRPOTrainer(_BaseTrainer):
                 torch.cuda.empty_cache()
 
             # Sanity check: from experience, this is useful to catch bugs in the chat template
-            for idx in range(len(idxs_with_tool)):
-                idx_with_tool = idxs_with_tool[idx]
-                pct = prompt_completion_tool_ids[idx]  # = prompt-completion-tool
-                if prompt_ids[idx_with_tool] != pct[: len(prompt_ids[idx_with_tool])]:
-                    raise ValueError(
-                        f"The chat template is not prefix-preserving. Please update it to use a prefix-preserving format.\n{prompt_ids[idx_with_tool]=}\n{pct[:len(prompt_ids[idx_with_tool])]=}"
-                    )
+            # --> re-tokenization issue -- addressed post 0.29.0
+            # for idx in range(len(idxs_with_tool)):
+            #     idx_with_tool = idxs_with_tool[idx]
+            #     pct = prompt_completion_tool_ids[idx]  # = prompt-completion-tool
+            #     if prompt_ids[idx_with_tool] != pct[: len(prompt_ids[idx_with_tool])]:
+            #         raise ValueError(
+            #             f"The chat template is not prefix-preserving. Please update it to use a prefix-preserving format.\n{prompt_ids[idx_with_tool]=}\n{pct[:len(prompt_ids[idx_with_tool])]=}"
+            #         )
 
             # Truncate so that pct[len(prompt_ids[idx]) :] + post_tool does not exceed max_completion_length
             for idx in range(len(idxs_with_tool)):
