@@ -56,6 +56,7 @@ from transformers import (
 )
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available, is_rich_available
+# from transformers.utils.import_utils import enable_tf32
 
 from ..chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 from ..data_utils import (
@@ -1039,6 +1040,7 @@ class GRPOTrainer(_BaseTrainer):
         mm_token_type_ids=None,
     ) -> dict[str, torch.Tensor | None]:
         """Compute log-probs and (optionally) entropies for each token."""
+        # enable_tf32(True)
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
@@ -2230,6 +2232,9 @@ class GRPOTrainer(_BaseTrainer):
         return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)  # (B, 1)
 
     def _compute_loss(self, model, inputs):
+        # JK: PyTorch will crash otherwise (only seen when tf32=true and torch_compile=true)
+        torch.set_float32_matmul_precision('high')
+
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
