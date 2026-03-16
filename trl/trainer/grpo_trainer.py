@@ -56,7 +56,7 @@ from transformers import (
 )
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available, is_rich_available
-# from transformers.utils.import_utils import enable_tf32
+from transformers.utils.import_utils import is_torch_tf32_available   #,enable_tf32
 
 from ..chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 from ..data_utils import (
@@ -2232,8 +2232,9 @@ class GRPOTrainer(_BaseTrainer):
         return (is_pos_adv | is_low_kl).to(dtype=mask.dtype)  # (B, 1)
 
     def _compute_loss(self, model, inputs):
-        # JK: PyTorch will crash otherwise (only seen when tf32=true and torch_compile=true)
-        torch.set_float32_matmul_precision('high')
+        if is_torch_tf32_available():
+            # JK: PyTorch will crash otherwise (only seen when tf32=true and torch_compile=true)
+            torch.set_float32_matmul_precision('high')
 
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
